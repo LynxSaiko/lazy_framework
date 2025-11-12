@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -10,10 +9,14 @@ import subprocess
 import threading
 from contextlib import redirect_stdout, redirect_stderr
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
-from PyQt6.QtGui import QFont, QTextCursor, QPalette, QColor, QAction, QKeySequence
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QUrl
+from PyQt6.QtGui import QFont, QTextCursor, QPalette, QColor, QAction, QKeySequence, QIntValidator
 from PyQt6.QtCore import QSize
 from PyQt6.QtGui import QIcon
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtNetwork import QNetworkProxy
 # Import LazyFramework
 from bin.console import LazyFramework
 
@@ -109,7 +112,7 @@ class ModuleRunner(QThread):
             self.module_instance.run(self.framework.session)
 
         except Exception as e:
-            self.output.emit(f"[red]Module Error: {e}[/red]")
+            self.output.emit(f"Module Error: {e}")
         finally:
             # Restore everything
             self._restore_patches()
@@ -137,7 +140,7 @@ class ModuleRunner(QThread):
     def _patched_system(self, command):
         """Patched os.system"""
         try:
-            self.output.emit(f"[yellow]$ {command}[/yellow]")
+            self.output.emit(f"$ {command}")
 
             process = PatchedPopen(
                 command,
@@ -148,7 +151,7 @@ class ModuleRunner(QThread):
             process.wait()
             return process.returncode
         except Exception as e:
-            self.output.emit(f"[red]Command error: {e}[/red]")
+            self.output.emit(f"Command error: {e}")
             return -1
 
 # === RICH CONSOLE FOR GUI ===
@@ -167,9 +170,188 @@ class GUIConsole:
                 console.print(*args, **kwargs)
                 output = buffer.getvalue()
                 if output.strip():
-                    self.output_callback(output)
+                    # Clean ANSI sequences
+                    clean_output = re.sub(r'\x1b\[[0-9;]*[mG]', '', output)
+                    self.output_callback(clean_output)
         except Exception as e:
             self.output_callback(f"Console error: {e}")
+
+# === PROXY SETTINGS DIALOG ===
+class ProxySettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Proxy Settings")
+        self.setModal(True)
+        self.setFixedSize(400, 300)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        # Proxy List dari file
+        file_group = QGroupBox("Proxy List Source")
+        file_layout = QVBoxLayout()
+        
+        file_input_layout = QHBoxLayout()
+        self.file_input = QLineEdit()
+        self.file_input.setPlaceholderText("Path to proxies.txt or enter manual proxy")
+        self.file_input.textChanged.connect(self.on_file_changed)
+        file_input_layout.addWidget(self.file_input)
+        
+        browse_btn = QPushButton("📁")
+        browse_btn.setFixedWidth(40)
+        browse_btn.clicked.connect(self.browse_file)
+        file_input_layout.addWidget(browse_btn)
+        
+        file_layout.addLayout(file_input_layout)
+        
+        # Quick file buttons
+        quick_btn_layout = QHBoxLayout()
+        quick_btn_layout.addWidget(QLabel("Quick:"))
+        
+        proxies_btn = QPushButton("proxies.txt")
+        proxies_btn.clicked.connect(lambda: self.load_quick_file("proxies.txt"))
+        quick_btn_layout.addWidget(proxies_btn)
+        
+        tor_btn = QPushButton("Tor")
+        tor_btn.clicked.connect(lambda: self.set_tor_proxy())
+        quick_btn_layout.addWidget(tor_btn)
+        
+        file_layout.addLayout(quick_btn_layout)
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+
+        # Manual Proxy Input (sederhana)
+        manual_group = QGroupBox("Manual Proxy")
+        manual_layout = QFormLayout()
+        
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText("127.0.0.1 or proxy.com")
+        manual_layout.addRow("Host:", self.host_input)
+        
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("8080")
+        self.port_input.setValidator(QIntValidator(1, 65535))
+        manual_layout.addRow("Port:", self.port_input)
+        
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["HTTP", "SOCKS5", "SOCKS4"])
+        manual_layout.addRow("Type:", self.type_combo)
+        
+        manual_group.setLayout(manual_layout)
+        layout.addWidget(manual_group)
+
+        # Action Buttons
+        btn_layout = QHBoxLayout()
+        
+        test_btn = QPushButton("Test")
+        test_btn.clicked.connect(self.test_proxy)
+        btn_layout.addWidget(test_btn)
+        
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self.apply_proxy)
+        apply_btn.setDefault(True)
+        btn_layout.addWidget(apply_btn)
+        
+        disable_btn = QPushButton("Disable")
+        disable_btn.clicked.connect(self.disable_proxy)
+        btn_layout.addWidget(disable_btn)
+        
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+        self.load_current_settings()
+
+    def browse_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Proxy File", "", "Text Files (*.txt);;All Files (*)"
+        )
+        if file_path:
+            self.file_input.setText(file_path)
+            self.load_proxy_from_file(file_path)
+
+    def load_quick_file(self, filename):
+        if os.path.exists(filename):
+            self.file_input.setText(filename)
+            self.load_proxy_from_file(filename)
+        else:
+            QMessageBox.information(self, "Info", f"{filename} not found")
+
+    def set_tor_proxy(self):
+        self.host_input.setText("127.0.0.1")
+        self.port_input.setText("9050")
+        self.type_combo.setCurrentText("SOCKS5")
+        self.file_input.clear()
+
+    def on_file_changed(self, text):
+        if text and os.path.exists(text) and text.endswith('.txt'):
+            self.load_proxy_from_file(text)
+
+    def load_proxy_from_file(self, file_path):
+        """Load first proxy from file"""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        # Simple parsing: ip:port
+                        if ':' in line:
+                            parts = line.split(':')
+                            if len(parts) >= 2:
+                                self.host_input.setText(parts[0].strip())
+                                self.port_input.setText(parts[1].strip())
+                                if len(parts) > 2 and parts[2].strip().upper() in ['SOCKS5', 'SOCKS4']:
+                                    self.type_combo.setCurrentText(parts[2].strip().upper())
+                                break
+            self.parent.append_output(f"✓ Loaded proxy from {file_path}")
+        except Exception as e:
+            self.parent.append_output(f"✗ Failed to load proxy file: {e}")
+
+    def load_current_settings(self):
+        if self.parent.current_proxy:
+            self.host_input.setText(self.parent.current_proxy.get('server', ''))
+            self.port_input.setText(str(self.parent.current_proxy.get('port', '')))
+            self.type_combo.setCurrentText(self.parent.current_proxy.get('type', 'HTTP').upper())
+
+    def test_proxy(self):
+        proxy_config = self.get_proxy_config()
+        if proxy_config:
+            self.parent.test_proxy_connection(proxy_config)
+
+    def apply_proxy(self):
+        proxy_config = self.get_proxy_config()
+        if proxy_config:
+            self.parent.set_proxy(proxy_config)
+            self.parent.enable_proxy()
+            self.accept()
+
+    def disable_proxy(self):
+        self.parent.disable_proxy()
+        self.accept()
+
+    def get_proxy_config(self):
+        host = self.host_input.text().strip()
+        port = self.port_input.text().strip()
+        proxy_type = self.type_combo.currentText().lower()
+
+        if not host or not port:
+            QMessageBox.warning(self, "Error", "Please enter host and port")
+            return None
+
+        try:
+            port_int = int(port)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Please enter a valid port number")
+            return None
+
+        return {
+            'type': proxy_type,
+            'server': host,
+            'port': port_int,
+            'username': '',
+            'password': ''
+        }
 
 # === MAIN GUI COMPLETE ===
 class LazyFrameworkGUI(QMainWindow):
@@ -188,7 +370,9 @@ class LazyFrameworkGUI(QMainWindow):
         self.command_history = []
         self.history_index = -1
         self.module_runner = None
-
+        self.current_proxy = None
+        self.proxy_enabled = False
+        
         self.init_ui()
         self.start_global_capture()
         self.load_banner()
@@ -196,7 +380,12 @@ class LazyFrameworkGUI(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("LazyFramework GUI")
         self.setGeometry(100, 50, 1800, 1000)
-
+        QTimer.singleShot(2000, self.start_tor_auto_rotate)
+         # Apply saved font (if any)
+        saved_font = self.framework.session.get('font', 'Roboto Mono Bold')
+        saved_size = self.framework.session.get('font_size', 12)
+        default_font = QFont(saved_font, saved_size)
+        self.setFont(default_font)
         # Set dark theme
         self.set_dark_theme()
 
@@ -274,7 +463,7 @@ class LazyFrameworkGUI(QMainWindow):
                 color: #d4d4d4;
                 border: 1px solid #404040;
                 border-radius: 4px;
-                font-family: 'Consolas', 'Monaco', monospace;
+                font-family: 'Roboto Mono';
             }
             QListWidget, QTableWidget {
                 background: #252525;
@@ -364,6 +553,10 @@ class LazyFrameworkGUI(QMainWindow):
                 border: 1px solid #404040;
                 selection-background-color: #0078d4;
             }
+            QWebEngineView {
+                border: 1px solid #404040;
+                border-radius: 4px;
+            }
         """)
 
     def create_menu_bar(self):
@@ -397,6 +590,35 @@ class LazyFrameworkGUI(QMainWindow):
         clear_action.setShortcut('Ctrl+L')
         clear_action.triggered.connect(self.clear_console)
         tools_menu.addAction(clear_action)
+
+         # Settings menu
+        settings_menu = menubar.addMenu('Settings')
+        font_action = QAction('Change Font', self)
+        font_action.triggered.connect(self.change_font)
+        settings_menu.addAction(font_action)
+
+        # Proxy menu
+        proxy_menu = menubar.addMenu('Proxy')
+    
+        proxy_settings = QAction('Proxy Settings', self)
+        proxy_settings.setShortcut('Ctrl+P')
+        proxy_settings.triggered.connect(self.show_proxy_settings)
+        proxy_menu.addAction(proxy_settings)
+        
+        proxy_menu.addSeparator()
+        
+        enable_proxy = QAction('Enable Proxy', self)
+        enable_proxy.setShortcut('Ctrl+Shift+P')
+        enable_proxy.triggered.connect(self.enable_proxy)
+        proxy_menu.addAction(enable_proxy)
+        
+        disable_proxy = QAction('Disable Proxy', self)
+        disable_proxy.triggered.connect(self.disable_proxy)
+        proxy_menu.addAction(disable_proxy)
+        
+        test_proxy = QAction('Test Proxy', self)
+        test_proxy.triggered.connect(self.test_proxy_connection)
+        proxy_menu.addAction(test_proxy)
 
     def create_left_sidebar(self):
         """Create left sidebar with modules and categories"""
@@ -438,15 +660,62 @@ class LazyFrameworkGUI(QMainWindow):
         self.module_list.itemDoubleClicked.connect(self.load_selected_module)
         layout.addWidget(self.module_list)
 
-        # Module info panel
-        info_group = QGroupBox("Module Info")
+        # === MODIFIED: Info Group dengan Browser ===
+        info_group = QGroupBox()
         info_layout = QVBoxLayout()
 
+        # Tab widget untuk menggabungkan info dan browser
+        info_browser_tabs = QTabWidget()
+        
+        # Tab 1: Module Info (sebelumnya)
         self.module_info = QTextEdit()
         self.module_info.setMaximumHeight(150)
         self.module_info.setReadOnly(True)
-        info_layout.addWidget(self.module_info)
-
+        info_browser_tabs.addTab(self.module_info, "Module Info")
+        
+        # Tab 2: Browser (baru)
+        browser_tab = QWidget()
+        browser_layout = QVBoxLayout(browser_tab)
+        
+        # Browser controls
+        browser_controls = QHBoxLayout()
+        self.url_bar = QLineEdit()
+        self.url_bar.setPlaceholderText("Enter URL or search...")
+        self.url_bar.returnPressed.connect(self.navigate_to_url)
+        
+        go_btn = QPushButton("Go")
+        go_btn.clicked.connect(self.navigate_to_url)
+        
+        back_btn = QPushButton("←")
+        back_btn.clicked.connect(self.browser_back)
+        
+        forward_btn = QPushButton("→")
+        forward_btn.clicked.connect(self.browser_forward)
+        
+        refresh_btn = QPushButton("↻")
+        refresh_btn.clicked.connect(self.browser_refresh)
+        
+        browser_controls.addWidget(back_btn)
+        browser_controls.addWidget(forward_btn)
+        browser_controls.addWidget(refresh_btn)
+        browser_controls.addWidget(self.url_bar)
+        browser_controls.addWidget(go_btn)
+        
+        browser_layout.addLayout(browser_controls)
+        
+        # Web browser view
+        self.browser = QWebEngineView()
+        self.browser.urlChanged.connect(self.update_url_bar)
+        self.browser.loadStarted.connect(self.on_load_started)
+        self.browser.loadFinished.connect(self.on_load_finished)
+        
+        # Set default page
+        self.browser.setUrl(QUrl("https://www.google.com"))
+        
+        browser_layout.addWidget(self.browser)
+        info_browser_tabs.addTab(browser_tab, "Browser")
+        
+        info_layout.addWidget(info_browser_tabs)
         info_group.setLayout(info_layout)
         layout.addWidget(info_group)
 
@@ -463,7 +732,8 @@ class LazyFrameworkGUI(QMainWindow):
         # Console tab
         self.console_output = QTextEdit()
         self.console_output.setReadOnly(True)
-        self.console_output.setFont(QFont("Hack", 12))
+        self.console_output.setFont(QFont("Roboto Mono Bold", 11))
+        self.console_output.setAcceptRichText(True)
         self.tabs.addTab(self.console_output, "Console")
 
         # Options tab
@@ -529,12 +799,30 @@ class LazyFrameworkGUI(QMainWindow):
 
         # Session info
         session_group = QGroupBox("Session Info")
+        session_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: normal;
+                color: #ffffff;  /* Ubah menjadi putih */
+                border: 1px solid #404040;
+                margin-top: 10px;
+                padding-top: 10px;
+                border-radius: 4px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px;
+                background: #1e1e1e;
+                color: #ffffff;  /* Judul group juga putih */
+            }
+        """)
         session_layout = QVBoxLayout()
 
         self.session_info = QTextEdit()
         self.session_info.setMaximumHeight(120)
         self.session_info.setReadOnly(True)
         self.session_info.setFont(QFont("Hack", 10))
+        self.session_info.setStyleSheet("color: #ffffff; background-color: #252525;")
         session_layout.addWidget(self.session_info)
 
         session_group.setLayout(session_layout)
@@ -542,6 +830,23 @@ class LazyFrameworkGUI(QMainWindow):
 
         # Quick actions
         actions_group = QGroupBox("Quick Actions")
+        actions_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: normal;
+                color: #ffffff;
+                border: 1px solid #404040;
+                margin-top: 10px;
+                padding-top: 10px;
+                border-radius: 4px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px;
+                background: #1e1e1e;
+                color: #ffffff;
+            }
+        """)
         actions_layout = QVBoxLayout()
 
         quick_actions = [
@@ -578,11 +883,254 @@ class LazyFrameworkGUI(QMainWindow):
 
         return sidebar
 
+    # === BROWSER METHODS ===
+    def navigate_to_url(self):
+        """Navigate to URL from url bar"""
+        url = self.url_bar.text().strip()
+        if url:
+            if not url.startswith(('http://', 'https://')):
+                if '.' in url:
+                    url = 'https://' + url
+                else:
+                    url = 'https://www.google.com/search?q=' + url.replace(' ', '+')
+            self.browser.setUrl(QUrl(url))
+
+    def browser_back(self):
+        """Browser back button"""
+        self.browser.back()
+
+    def browser_forward(self):
+        """Browser forward button"""
+        self.browser.forward()
+
+    def browser_refresh(self):
+        """Browser refresh button"""
+        self.browser.reload()
+
+    def update_url_bar(self, url):
+        """Update url bar when page changes"""
+        self.url_bar.setText(url.toString())
+
+    def on_load_started(self):
+        """Handle page load start"""
+        self.url_bar.setPlaceholderText("Loading...")
+
+    def on_load_finished(self, ok):
+        """Handle page load finish"""
+        if ok:
+            self.url_bar.setPlaceholderText("Enter URL or search...")
+        else:
+            self.url_bar.setPlaceholderText("Failed to load page")
+
+    # === PROXY METHODS - DIPERBAIKI ===
+    def show_proxy_settings(self):
+        """Show proxy settings dialog"""
+        dialog = ProxySettingsDialog(self)
+        dialog.exec()
+
+    # === PROXY METHODS - SIMPLE VERSION ===
+    def set_proxy(self, proxy_config):
+        """Set proxy configuration - untuk requests + browser (PyQt6 safe)"""
+        try:
+            self.current_proxy = proxy_config
+            self.proxy_enabled = True
+            self.apply_proxy_to_requests()
+
+            # === Browser Proxy (QWebEngineView) ===
+            from PyQt6.QtNetwork import QNetworkProxy
+
+            proxy_type = proxy_config['type'].lower()
+            server = proxy_config['server']
+            port = proxy_config['port']
+
+            if proxy_type.startswith("socks5"):
+                qtype = QNetworkProxy.ProxyType.Socks5Proxy
+            elif proxy_type.startswith("socks4"):
+                qtype = QNetworkProxy.ProxyType.Socks4Proxy
+            else:
+                qtype = QNetworkProxy.ProxyType.HttpProxy
+
+            qproxy = QNetworkProxy(qtype, server, port)
+            QNetworkProxy.setApplicationProxy(qproxy)
+
+            self.append_output("✓ Browser proxy applied via QNetworkProxy")
+
+            # === Logging / konfirmasi ===
+            proxy_info = f"{server}:{port}"
+            if proxy_type != 'http':
+                proxy_info += f" [{proxy_type.upper()}]"
+            self.append_output(f"✓ Proxy configured: {proxy_info}")
+            self.append_output(f"Note: Proxy applied to requests + browser")
+
+            self.update_proxy_status()
+
+        except Exception as e:
+            self.append_output(f"✗ Proxy error: {e}")
+
+    def enable_proxy(self):
+        """Enable proxy - otomatis ganti IP Tor"""
+        if not self.current_proxy:
+            self.append_output("No proxy configured. Please set proxy first.")
+            self.show_proxy_settings()
+            return
+
+        self.proxy_enabled = True
+        self.apply_proxy_to_requests()
+        self.append_output("✓ Proxy enabled for system/requests")
+        self.append_output("ℹ Browser will use system proxy settings")
+
+        # === Tambahan: jika proxy adalah Tor (127.0.0.1:9050), ganti IP otomatis ===
+        try:
+            if self.current_proxy['server'] == '127.0.0.1' and str(self.current_proxy['port']) == '9050':
+                from stem import Signal
+                from stem.control import Controller
+                with Controller.from_port(port=9051) as c:
+                    c.authenticate()
+                    c.signal(Signal.NEWNYM)
+                self.append_output("↻ Tor circuit renewed automatically (new IP)")
+        except Exception as e:
+            self.append_output(f"✗ Could not renew Tor IP automatically: {e}")
+
+        self.update_proxy_status()
+
+    def disable_proxy(self):
+        """Disable proxy - SIMPLE VERSION"""
+        self.proxy_enabled = False
+        self.apply_proxy_to_requests()
+        self.append_output("Proxy disabled")
+        self.update_proxy_status()
+
+    def apply_proxy_to_requests(self):
+        """Apply proxy settings to requests library - SIMPLE VERSION"""
+        if not self.current_proxy or not self.proxy_enabled:
+            # Clear proxy dari environment
+            for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+                if var in os.environ:
+                    del os.environ[var]
+            return
+
+        try:
+            proxy_type = self.current_proxy['type']
+            server = self.current_proxy['server']
+            port = self.current_proxy['port']
+
+            # Build proxy URL
+            proxy_url = f"{proxy_type}://{server}:{port}"
+
+            # Set environment variables untuk requests
+            os.environ['HTTP_PROXY'] = proxy_url
+            os.environ['HTTPS_PROXY'] = proxy_url
+            os.environ['http_proxy'] = proxy_url
+            os.environ['https_proxy'] = proxy_url
+
+            self.append_output(f"System proxy set: {proxy_url}")
+            
+        except Exception as e:
+            self.append_output(f"System proxy error: {e}")
+
+    def test_proxy_connection(self, proxy_config=None):
+        """Test proxy connection (enhanced with Tor fallback and better timeout)"""
+        config = proxy_config or self.current_proxy
+        
+        if not config:
+            self.append_output("No proxy configured to test")
+            return
+
+        self.append_output(f"Testing proxy {config['server']}:{config['port']}...")
+
+        import socket
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # Auto-detect Tor Browser port
+        try:
+            s = socket.socket()
+            s.settimeout(1)
+            s.connect(("127.0.0.1", config["port"]))
+        except Exception:
+            try:
+                s = socket.socket()
+                s.settimeout(1)
+                s.connect(("127.0.0.1", 9150))
+                config["port"] = 9150
+                self.append_output("Detected Tor Browser (using port 9150)")
+            except Exception:
+                pass
+        finally:
+            s.close()
+
+        proxy_scheme = config["type"]
+        if proxy_scheme.startswith("socks5"):
+            proxy_scheme = "socks5h"
+
+        proxies = {
+            "http": f"{proxy_scheme}://{config['server']}:{config['port']}",
+            "https": f"{proxy_scheme}://{config['server']}:{config['port']}"
+        }
+
+        test_url = "https://api.ipify.org?format=json"
+        try:
+            response = requests.get(test_url, proxies=proxies, timeout=30, verify=False)
+            if response.status_code == 200:
+                ip_info = response.json()
+                self.append_output(f"✓ Proxy working! Your IP: {ip_info.get('ip', 'Unknown')}")
+                return True
+            else:
+                self.append_output(f"✗ Proxy test failed (status {response.status_code})")
+                return False
+
+        except requests.exceptions.ConnectTimeout:
+            self.append_output("✗ Proxy test failed: connection timed out (Tor may be slow)")
+            return False
+        except requests.exceptions.ProxyError as e:
+            self.append_output(f"✗ Proxy error: {e}")
+            return False
+        except Exception as e:
+            self.append_output(f"✗ Proxy test failed: {e}")
+            return False
+
+    # Proxy Auto
+    def start_tor_auto_rotate(self):
+        """Rotasi IP Tor otomatis setiap 5 menit"""
+        from PyQt6.QtCore import QTimer
+
+        self.tor_timer = QTimer(self)
+        self.tor_timer.setInterval(300000)  # 5 menit = 300000 ms
+        self.tor_timer.timeout.connect(self.rotate_tor_ip)
+        self.tor_timer.start()
+        self.append_output("Auto Tor IP rotation enabled (every 5 minutes)")
+
+    def rotate_tor_ip(self):
+        """Ganti circuit Tor otomatis (NEWNYM)"""
+        try:
+            from stem import Signal
+            from stem.control import Controller
+
+            # Coba kirim sinyal NEWNYM langsung tanpa syarat proxy_enabled
+            with Controller.from_port(port=9051) as c:
+                c.authenticate()
+                c.signal(Signal.NEWNYM)
+
+            self.append_output("↻ Tor IP auto-rotated (every 5 min)")
+
+        except Exception as e:
+            self.append_output(f"✗ Auto-rotate failed: {e}")
+    #=======================================
+        
+    def update_proxy_status(self):
+        """Update proxy status display"""
+        # Update session info dengan status proxy
+        self.update_session_info()
+
     def append_output(self, text):
-        """Append text to console output dengan basic rich formatting"""
+        if not text:
+           return
+        
         clean_text = re.sub(r'\x1b\[[0-9;]*[mG]','', text)  # Remove ANSI escape sequences
         self.console_output.append(clean_text)
         self.console_output.moveCursor(QTextCursor.MoveOperation.End)
+
 
     def load_banner(self):
         """Load and display banner"""
@@ -591,8 +1139,7 @@ class LazyFrameworkGUI(QMainWindow):
             banner = get_random_banner()
             self.append_output(f"<pre style='color:#00ff00'>{banner}</pre>")
         except:
-            self.append_output(
-                "[green]LazyFramework GUI v2.0[/green]")
+            self.append_output("LazyFramework GUI v2.0")
 
     def load_all_modules(self):
         """Load all modules into the list"""
@@ -694,7 +1241,7 @@ class LazyFrameworkGUI(QMainWindow):
                 self.show_module_info_in_tab()
                 
         except Exception as e:
-            self.append_output(f"[red]Error loading module: {e}[/red]")
+            self.append_output(f"Error loading module: {e}")
 
     def show_module_info_in_tab(self):
         """Show module info di tab Module Info saja"""
@@ -746,7 +1293,7 @@ class LazyFrameworkGUI(QMainWindow):
 
         # Tampilkan command yang di-execute (kecuali untuk klik module)
         if command != "use" or not args or "modules/" not in args[0]:
-            self.append_output(f"[yellow]> {command} {' '.join(args)}[/yellow]")
+            self.append_output(f"> {command} {' '.join(args)}")
 
         try:
             if hasattr(self.framework, f"cmd_{command}"):
@@ -779,10 +1326,10 @@ class LazyFrameworkGUI(QMainWindow):
                     self.on_module_unloaded()
 
             else:
-                self.append_output(f"[red]Unknown command: {command}[/red]")
+                self.append_output(f"Unknown command: {command}")
 
         except Exception as e:
-            self.append_output(f"[red]Error executing command: {e}[/red]")
+            self.append_output(f"Error executing command: {e}")
 
         self.update_session_info()
 
@@ -865,7 +1412,7 @@ class LazyFrameworkGUI(QMainWindow):
     def run_module(self):
         """Run the current module dengan FIXED OUTPUT CAPTURE"""
         if not self.framework.loaded_module:
-            self.append_output("[red]No module loaded[/red]")
+            self.append_output("No module loaded")
             return
 
         # Update options from GUI
@@ -874,9 +1421,9 @@ class LazyFrameworkGUI(QMainWindow):
             if value:
                 try:
                     self.framework.loaded_module.set_option(name, value)
-                    self.append_output(f"[cyan]Set {name} => {value}[/cyan]")
+                    self.append_output(f"Set {name} => {value}")
                 except Exception as e:
-                    self.append_output(f"[red]Error setting {name}: {e}[/red]")
+                    self.append_output(f"Error setting {name}: {e}")
 
         # Disable run button during execution
         self.run_btn.setEnabled(False)
@@ -892,8 +1439,8 @@ class LazyFrameworkGUI(QMainWindow):
     def on_module_finished(self):
         """Handle module completion"""
         self.run_btn.setEnabled(True)
-        self.run_btn.setText("🚀 RUN MODULE")
-        self.append_output("[green]Module execution completed[/green]")
+        self.run_btn.setText("WAITING")
+        self.append_output("Module execution completed")
 
     def unload_module(self):
         """Unload current module"""
@@ -907,19 +1454,50 @@ class LazyFrameworkGUI(QMainWindow):
         """Refresh modules list"""
         self.framework.scan_modules()
         self.load_all_modules()
-        self.append_output("[green]Modules refreshed[/green]")
+        self.append_output("Modules refreshed")
 
     def clear_console(self):
         """Clear console output"""
         self.console_output.clear()
 
+    def change_font(self):
+        """Open font selection dialog and apply to all text widgets"""
+        font, ok = QFontDialog.getFont(self)
+        if ok:
+            # Terapkan font ke widget utama yang menampilkan teks
+            self.console_output.setFont(font)
+            self.module_detail_info.setFont(font)
+            self.session_info.setFont(font)
+            for i in range(self.module_list.count()):
+                item = self.module_list.item(i)
+                item.setFont(font)
+
+            # Terapkan ke input field juga jika mau
+            for widget in getattr(self, 'option_widgets', {}).values():
+                widget.setFont(font)
+
+            # Simpan ke framework session (opsional)
+            self.framework.session['font'] = font.family()
+            self.framework.session['font_size'] = font.pointSize()
+
+            # Konfirmasi ke pengguna
+            self.append_output(f"Font changed to {font.family()} ({font.pointSize()}pt)")
+
     def update_session_info(self):
-        """Update session information"""
+        """Update session information dengan proxy status"""
+        proxy_status = "Enabled" if self.proxy_enabled else "Disabled"
+        proxy_details = ""
+        
+        if self.proxy_enabled and self.current_proxy:
+            proxy_details = f"{self.current_proxy['server']}:{self.current_proxy['port']} ({self.current_proxy['type']})"
+
         info_text = f"""
 User: {self.framework.session.get('user', 'unknown')}
 Modules: {len(self.framework.modules)}
 Loaded: {self.current_module or 'None'}
 Framework: LazyFramework GUI
+Proxy: {proxy_status}
+{proxy_details}
         """.strip()
 
         self.session_info.setPlainText(info_text)
@@ -947,6 +1525,30 @@ Framework: LazyFramework GUI
 
 def run_gui():
     """Run the GUI application"""
+    import platform
+    
+    # Fix environment variables for WebEngine
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--no-sandbox --disable-gpu-sandbox --disable-features=VizDisplayCompositor'
+    os.environ['QT_QPA_PLATFORM'] = 'xcb'
+    os.environ['QT_QUICK_BACKEND'] = 'software'
+    os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    
+    
+    # Fix SSL certificates untuk Linux
+    if platform.system() == "Linux":
+        os.environ['QTWEBENGINE_DISABLE_SANDBOX'] = '1'
+        # Coba berbagai path certificate yang umum
+        cert_paths = [
+            '/etc/ssl/certs/ca-certificates.crt',
+            '/etc/ssl/certs/ca-bundle.crt',
+            '/etc/pki/tls/certs/ca-bundle.crt'
+        ]
+        for cert_path in cert_paths:
+            if os.path.exists(cert_path):
+                os.environ['SSL_CERT_FILE'] = cert_path
+                os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+                break
+    
     app = QApplication(sys.argv)
     app.setApplicationName("LazyFramework GUI")
     app.setApplicationVersion("2.0")
