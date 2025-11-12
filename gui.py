@@ -1,146 +1,978 @@
-# gui.py
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import sys
+import os
+import io
+import re
+import subprocess
 import threading
-from queue import Queue  # <-- INI YANG BENAR
-import shlex
-import time
+from contextlib import redirect_stdout, redirect_stderr
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
-from PyQt6.QtGui import QFont
-from rich.console import Console as RichConsole
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
+from PyQt6.QtGui import QFont, QTextCursor, QPalette, QColor, QAction, QKeySequence
+from PyQt6.QtCore import QSize
+from PyQt6.QtGui import QIcon
+# Import LazyFramework
+from bin.console import LazyFramework
 
-from bin.console import LazyFramework  # Sesuai struktur asli
-
-class RichCapture(QObject):
+# === UNIVERSAL OUTPUT CAPTURE ===
+class UniversalCapture(QObject):
     output_signal = pyqtSignal(str)
-    def __init__(self):
-        super().__init__()
-        self.console = RichConsole(force_terminal=True, width=120)
-    def print(self, *args, **kwargs):
-        with self.console.capture() as cap:
-            self.console.print(*args, **kwargs)
-        self.output_signal.emit(cap.get())
 
-class GUIFramework(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        self.original_print = __builtins__['print']
+
+    def start_capture(self):
+        """Start capturing all output"""
+        sys.stdout = self
+        sys.stderr = self
+        __builtins__['print'] = self.print_capture
+
+    def stop_capture(self):
+        """Stop capturing"""
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+        __builtins__['print'] = self.original_print
+
+    def write(self, text):
+        """Capture stdout/stderr"""
+        if text and text.strip():
+            self.output_signal.emit(str(text))
+
+    def flush(self):
+        pass
+
+    def print_capture(self, *args, **kwargs):
+        """Capture print statements"""
+        sep = kwargs.get('sep', ' ')
+        end = kwargs.get('end', '\n')
+        text = sep.join(str(arg) for arg in args) + end
+        self.output_signal.emit(text)
+
+# === PATCHED SUBPROCESS ===
+class PatchedPopen(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        self.output_callback = kwargs.pop('output_callback', None)
+
+        # Force capture output
+        kwargs['stdout'] = subprocess.PIPE
+        kwargs['stderr'] = subprocess.STDOUT
+        kwargs['universal_newlines'] = True
+        kwargs['bufsize'] = 1
+
+        super().__init__(*args, **kwargs)
+
+        if self.output_callback and self.stdout:
+            self.output_thread = threading.Thread(target=self._read_output)
+            self.output_thread.daemon = True
+            self.output_thread.start()
+
+    def _read_output(self):
+        """Read output in real-time"""
+        try:
+            for line in iter(self.stdout.readline, ''):
+                if line and self.output_callback:
+                    self.output_callback(line.rstrip())
+        except Exception:
+            pass
+
+# === MODULE RUNNER WITH SUBPROCESS PATCHING ===
+class ModuleRunner(QThread):
+    output = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, framework, module_instance):
+        super().__init__()
+        self.framework = framework
+        self.module_instance = module_instance
+        self.capture = UniversalCapture()
+        self.capture.output_signal.connect(self.output.emit)
+
+        # Backup original functions
+        self.original_popen = subprocess.Popen
+        self.original_system = os.system
+
+    def run(self):
+        try:
+            # Apply patches before capture
+            self._apply_patches()
+
+            # Start capturing ALL output
+            self.capture.start_capture()
+
+            # Run the module
+            self.module_instance.run(self.framework.session)
+
+        except Exception as e:
+            self.output.emit(f"[red]Module Error: {e}[/red]")
+        finally:
+            # Restore everything
+            self._restore_patches()
+            self.capture.stop_capture()
+            self.finished.emit()
+
+    def _apply_patches(self):
+        """Apply all necessary patches"""
+        # Patch subprocess.Popen
+        subprocess.Popen = self._patched_popen
+
+        # Patch os.system
+        os.system = self._patched_system
+
+    def _restore_patches(self):
+        """Restore original functions"""
+        subprocess.Popen = self.original_popen
+        os.system = self.original_system
+
+    def _patched_popen(self, *args, **kwargs):
+        """Patched subprocess.Popen"""
+        kwargs['output_callback'] = self.output.emit
+        return PatchedPopen(*args, **kwargs)
+
+    def _patched_system(self, command):
+        """Patched os.system"""
+        try:
+            self.output.emit(f"[yellow]$ {command}[/yellow]")
+
+            process = PatchedPopen(
+                command,
+                shell=True,
+                output_callback=self.output.emit
+            )
+
+            process.wait()
+            return process.returncode
+        except Exception as e:
+            self.output.emit(f"[red]Command error: {e}[/red]")
+            return -1
+
+# === RICH CONSOLE FOR GUI ===
+class GUIConsole:
+    def __init__(self, output_callback):
+        self.output_callback = output_callback
+
+    def print(self, *args, **kwargs):
+        """Print dengan rich formatting ke GUI"""
+        try:
+            from io import StringIO
+            from rich.console import Console
+
+            with StringIO() as buffer:
+                console = Console(file=buffer, force_terminal=False, width=120)
+                console.print(*args, **kwargs)
+                output = buffer.getvalue()
+                if output.strip():
+                    self.output_callback(output)
+        except Exception as e:
+            self.output_callback(f"Console error: {e}")
+
+# === MAIN GUI COMPLETE ===
+class LazyFrameworkGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowIcon(QIcon(""))
         self.framework = LazyFramework()
-        self.capture = RichCapture()
+        self.capture = UniversalCapture()
         self.capture.output_signal.connect(self.append_output)
-        self.framework.console = self.capture
-        self.input_queue = Queue()  # <-- PAKAI Queue() dari queue
-        self.thread = threading.Thread(target=self.repl_loop, daemon=True)
-        self.thread.start()
+
+        # Replace framework console dengan GUI console
+        self.framework.console = GUIConsole(self.append_output)
+
+        self.current_module = None
+        self.workers = []
+        self.command_history = []
+        self.history_index = -1
+        self.module_runner = None
+
         self.init_ui()
+        self.start_global_capture()
+        self.load_banner()
 
     def init_ui(self):
         self.setWindowTitle("LazyFramework GUI")
-        self.setGeometry(100, 100, 1400, 900)
-        self.setStyleSheet("background: #1e1e1e; color: #d4d4d4;")
+        self.setGeometry(100, 50, 1800, 1000)
+
+        # Set dark theme
+        self.set_dark_theme()
+
+        # Create menu bar
+        self.create_menu_bar()
+
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        header = QLabel("LAZY FRAMEWORK")
-        header.setStyleSheet("font-size: 24px; color: #00ff00; font-weight: bold;")
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(header)
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
+        layout = QHBoxLayout(central)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
-        # Console Tab
-        console_tab = QWidget()
-        cl = QVBoxLayout(console_tab)
-        self.output = QTextEdit()
-        self.output.setReadOnly(True)
-        self.output.setFont(QFont("Consolas", 10))
-        self.output.setStyleSheet("background: #0d0d0d; color: #d4d4d4;")
-        cl.addWidget(self.output)
-        input_layout = QHBoxLayout()
-        self.input_field = QLineEdit()
-        self.input_field.returnPressed.connect(self.send_command)
-        btn = QPushButton("Run")
-        btn.clicked.connect(self.send_command)
-        btn.setStyleSheet("background: #00ff00; color: black;")
-        input_layout.addWidget(self.input_field)
-        input_layout.addWidget(btn)
-        cl.addLayout(input_layout)
-        tabs.addTab(console_tab, "Console")
+        # === LEFT SIDEBAR ===
+        left_sidebar = self.create_left_sidebar()
+        layout.addWidget(left_sidebar, 1)
 
-        # Modules Tab
-        mod_tab = QWidget()
-        ml = QVBoxLayout(mod_tab)
-        btns = QHBoxLayout()
-        for t in ["All", "Recon", "Strike", "Hold", "Ops", "Payloads"]:
-            b = QPushButton(t)
-            b.clicked.connect(lambda _, x=t.lower(): self.load_modules(x))
-            b.setStyleSheet("background: #333; color: white;")
-            btns.addWidget(b)
-        ml.addLayout(btns)
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Module", "Rank", "Type", "Desc"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.doubleClicked.connect(self.use_from_table)
-        ml.addWidget(self.table)
-        tabs.addTab(mod_tab, "Modules")
+        # === MAIN CONTENT AREA ===
+        main_content = self.create_main_content()
+        layout.addWidget(main_content, 3)
 
-    def repl_loop(self):
-        while True:
-            try:
-                cmd = self.input_queue.get(timeout=0.1)
-                if cmd is None: continue
-                parts = shlex.split(cmd)
-                if not parts: continue
-                c, a = parts[0], parts[1:]
-                if c in ("exit", "quit"): break
-                getattr(self.framework, f"cmd_{c}", lambda x: self.append_output("Unknown"))(a)
-            except:
-                time.sleep(0.1)
+        # === RIGHT SIDEBAR ===
+        right_sidebar = self.create_right_sidebar()
+        layout.addWidget(right_sidebar, 1)
 
-    def send_command(self):
-        cmd = self.input_field.text().strip()
-        if cmd:
-            self.append_output(f"[bold cyan]lzf >[/bold cyan] {cmd}")
-            self.input_field.clear()
-            self.input_queue.put(cmd)
+        # Load initial modules
+        QTimer.singleShot(100, self.load_all_modules)
+
+    def start_global_capture(self):
+        """Start global output capture"""
+        self.capture.start_capture()
+
+    def set_dark_theme(self):
+        """Set dark theme for the application"""
+        self.setStyleSheet("""
+            QMainWindow {
+                background: #1e1e1e;
+                color: #d4d4d4;
+            }
+            QWidget {
+                background: #1e1e1e;
+                color: #d4d4d4;
+            }
+            QPushButton {
+                background: #2d2d2d;
+                color: #ffffff;
+                border: 1px solid #404040;
+                padding: 8px 12px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #3d3d3d;
+                border: 1px solid #505050;
+            }
+            QPushButton:pressed {
+                background: #1d1d1d;
+            }
+            QPushButton:disabled {
+                background: #252525;
+                color: #666666;
+            }
+            QLineEdit {
+                background: #252525;
+                color: #ffffff;
+                border: 1px solid #404040;
+                padding: 8px;
+                border-radius: 4px;
+                selection-background-color: #0078d4;
+            }
+            QLineEdit:focus {
+                border: 1px solid #0078d4;
+            }
+            QTextEdit {
+                background: #0d0d0d;
+                color: #d4d4d4;
+                border: 1px solid #404040;
+                border-radius: 4px;
+                font-family: 'Consolas', 'Monaco', monospace;
+            }
+            QListWidget, QTableWidget {
+                background: #252525;
+                color: #d4d4d4;
+                border: 1px solid #404040;
+                border-radius: 4px;
+                outline: none;
+            }
+            QListWidget::item:selected, QTableWidget::item:selected {
+                background: #0078d4;
+                color: white;
+            }
+            QListWidget::item:hover, QTableWidget::item:hover {
+                background: #2a2a2a;
+            }
+            QHeaderView::section {
+                background: #2d2d2d;
+                color: #d4d4d4;
+                padding: 6px;
+                border: none;
+                font-weight: normal;
+            }
+            QTabWidget::pane {
+                border: 1px solid #404040;
+                background: #252525;
+                font-size: 18px;
+            }
+            QTabBar::tab {
+                background: #2d2d2d;
+                color: #d4d4d4;
+                font-size: 13px;
+                padding: 8px 16px;
+                border: 1px solid #404040;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #0078d4;
+                color: white;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #3d3d3d;
+            }
+            QGroupBox {
+                font-weight: normal;
+                color: #00ff00;
+                border: 1px solid #404040;
+                margin-top: 10px;
+                padding-top: 10px;
+                border-radius: 4px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px;
+                background: #1e1e1e;
+            }
+            QLabel {
+                color: #d4d4d4;
+            }
+            QProgressBar {
+                border: 1px solid #404040;
+                border-radius: 4px;
+                background: #252525;
+                text-align: center;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background: #0078d4;
+                border-radius: 3px;
+            }
+            QComboBox {
+                background: #252525;
+                color: #ffffff;
+                border: 1px solid #404040;
+                padding: 6px;
+                border-radius: 4px;
+            }
+            QComboBox:hover {
+                border: 1px solid #505050;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background: #252525;
+                color: #ffffff;
+                border: 1px solid #404040;
+                selection-background-color: #0078d4;
+            }
+        """)
+
+    def create_menu_bar(self):
+        """Create menu bar"""
+        menubar = self.menuBar()
+
+        # File menu
+        file_menu = menubar.addMenu('File')
+
+        exit_action = QAction('Exit', self)
+        exit_action.setShortcut('Ctrl+Q')
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        # View menu
+        view_menu = menubar.addMenu('View')
+
+        refresh_action = QAction('Refresh Modules', self)
+        refresh_action.setShortcut('F5')
+        refresh_action.triggered.connect(self.refresh_modules)
+        view_menu.addAction(refresh_action)
+
+        # Tools menu
+        tools_menu = menubar.addMenu('Tools')
+
+        banner_action = QAction('Show Banner', self)
+        banner_action.triggered.connect(self.load_banner)
+        tools_menu.addAction(banner_action)
+
+        clear_action = QAction('Clear Console', self)
+        clear_action.setShortcut('Ctrl+L')
+        clear_action.triggered.connect(self.clear_console)
+        tools_menu.addAction(clear_action)
+
+    def create_left_sidebar(self):
+        """Create left sidebar with modules and categories"""
+        sidebar = QWidget()
+        sidebar.setMaximumWidth(400)
+        layout = QVBoxLayout(sidebar)
+
+        # Search box
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search modules...")
+        self.search_input.textChanged.connect(self.search_modules)
+        search_layout.addWidget(self.search_input)
+
+        search_btn = QPushButton("🔍")
+        search_btn.setFixedWidth(40)
+        search_btn.clicked.connect(self.perform_search)
+        search_layout.addWidget(search_btn)
+        layout.addLayout(search_layout)
+
+        # Category buttons
+        categories_layout = QHBoxLayout()
+        categories = [
+            ("All", "all"), ("Recon", "recon"), ("Strike", "strike"),
+            ("Hold", "hold"), ("Ops", "ops"), ("Payloads", "payloads")
+        ]
+
+        for name, cat_type in categories:
+            btn = QPushButton(name)
+            btn.setProperty('category', cat_type)
+            btn.clicked.connect(self.on_category_click)
+            
+            categories_layout.addWidget(btn)
+
+        layout.addLayout(categories_layout)
+
+        # Module list
+        self.module_list = QListWidget()
+        self.module_list.itemDoubleClicked.connect(self.load_selected_module)
+        layout.addWidget(self.module_list)
+
+        # Module info panel
+        info_group = QGroupBox("Module Info")
+        info_layout = QVBoxLayout()
+
+        self.module_info = QTextEdit()
+        self.module_info.setMaximumHeight(150)
+        self.module_info.setReadOnly(True)
+        info_layout.addWidget(self.module_info)
+
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        return sidebar
+
+    def create_main_content(self):
+        """Create main content area"""
+        main_widget = QWidget()
+        layout = QVBoxLayout(main_widget)
+
+        # Tab widget for different views
+        self.tabs = QTabWidget()
+
+        # Console tab
+        self.console_output = QTextEdit()
+        self.console_output.setReadOnly(True)
+        self.console_output.setFont(QFont("Hack", 12))
+        self.tabs.addTab(self.console_output, "Console")
+
+        # Options tab
+        self.options_widget = QWidget()
+        self.options_layout = QFormLayout(self.options_widget)
+        self.options_scroll = QScrollArea()
+        self.options_scroll.setWidgetResizable(True)
+        self.options_scroll.setWidget(self.options_widget)
+        self.tabs.addTab(self.options_scroll, "Options")
+
+        # Module info tab
+        self.module_detail_info = QTextEdit()
+        self.module_detail_info.setReadOnly(True)
+        self.module_detail_info.setFont(QFont("Hack", 12))
+        self.tabs.addTab(self.module_detail_info, "Module Info")
+
+        layout.addWidget(self.tabs)
+
+        # Control buttons
+        control_layout = QHBoxLayout()
+
+        self.run_btn = QPushButton("START")
+        self.run_btn.setStyleSheet("""
+            QPushButton {
+                background: #0e0e0f; 
+                color: white; 
+                font-weight: normal; 
+                font-size: 14px; 
+                padding: 12px;
+                border-radius: 6px;
+                outline: none;
+            }
+            QPushButton:hover {
+                background: #072ff5;
+            }
+            QPushButton:disabled {
+                background: #072ff5;
+                color: #888888;
+            }
+        """)
+        self.run_btn.clicked.connect(self.run_module)
+        self.run_btn.setEnabled(False)
+        control_layout.addWidget(self.run_btn)
+
+        self.back_btn = QPushButton("BACK")
+        self.back_btn.clicked.connect(self.unload_module)
+        self.back_btn.setEnabled(False)
+        control_layout.addWidget(self.back_btn)
+
+        clear_btn = QPushButton("Clear Console")
+        clear_btn.clicked.connect(self.clear_console)
+        control_layout.addWidget(clear_btn)
+
+        layout.addLayout(control_layout)
+
+        return main_widget
+
+    def create_right_sidebar(self):
+        """Create right sidebar with session info and quick actions"""
+        sidebar = QWidget()
+        sidebar.setMaximumWidth(380)
+        layout = QVBoxLayout(sidebar)
+
+        # Session info
+        session_group = QGroupBox("Session Info")
+        session_layout = QVBoxLayout()
+
+        self.session_info = QTextEdit()
+        self.session_info.setMaximumHeight(120)
+        self.session_info.setReadOnly(True)
+        self.session_info.setFont(QFont("Hack", 10))
+        session_layout.addWidget(self.session_info)
+
+        session_group.setLayout(session_layout)
+        layout.addWidget(session_group)
+
+        # Quick actions
+        actions_group = QGroupBox("Quick Actions")
+        actions_layout = QVBoxLayout()
+
+        quick_actions = [
+            ("Show Modules", "show modules"),
+            ("Show Options", "options"),
+            ("Module Info", "info"),
+            ("Scan Modules", "scan"),
+            ("Show Banner", "banner")
+        ]
+
+        for action_name, command in quick_actions:
+            btn = QPushButton(action_name)
+            btn.clicked.connect(
+                lambda checked, cmd=command: self.quick_command(cmd))
+            actions_layout.addWidget(btn)
+
+        actions_group.setLayout(actions_layout)
+        layout.addWidget(actions_group)
+
+        # Current module status
+        status_group = QGroupBox("Current Module")
+        status_layout = QVBoxLayout()
+
+        self.current_module_label = QLabel("No module loaded")
+        self.current_module_label.setStyleSheet(
+            "color: #ff5555; font-weight: bold;")
+        status_layout.addWidget(self.current_module_label)
+
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # Spacer
+        layout.addStretch()
+
+        return sidebar
 
     def append_output(self, text):
-        text = text.replace("[bold]", "<b>").replace("[/bold]", "</b>")
-        text = text.replace("[red]", "<span style='color:#ff5555'>").replace("[/red]", "</span>")
-        text = text.replace("[green]", "<span style='color:#50fa7b'>").replace("[/green]", "</span>")
-        text = text.replace("[yellow]", "<span style='color:#f1fa8c'>").replace("[/yellow]", "</span>")
-        text = text.replace("[cyan]", "<span style='color:#8be9fd'>").replace("[/cyan]", "</span>")
-        self.output.append(text)
+        """Append text to console output dengan basic rich formatting"""
+        clean_text = re.sub(r'\x1b\[[0-9;]*[mG]','', text)  # Remove ANSI escape sequences
+        self.console_output.append(clean_text)
+        self.console_output.moveCursor(QTextCursor.MoveOperation.End)
 
-    def load_modules(self, typ):
-        self.table.setRowCount(0)
+    def load_banner(self):
+        """Load and display banner"""
+        try:
+            from core import get_random_banner
+            banner = get_random_banner()
+            self.append_output(f"<pre style='color:#00ff00'>{banner}</pre>")
+        except:
+            self.append_output(
+                "[green]LazyFramework GUI v2.0[/green]")
+
+    def load_all_modules(self):
+        """Load all modules into the list"""
+        self.module_list.clear()
         modules = self.framework.metadata
-        if typ != "all":
-            modules = {k: v for k, v in modules.items() if f"/{typ}/" in k.lower() or (typ == "payloads" and "payload" in k.lower())}
-        self.table.setRowCount(len(modules))
-        for i, (k, m) in enumerate(sorted(modules.items())):
-            if not m.get("options"): continue
-            name = k.replace("modules/", "")
-            rank = m.get("rank", "Normal")
-            typ_name = k.split("/")[1] if len(k.split("/")) > 1 else "?"
-            desc = m.get("description", "N/A")
-            self.table.setItem(i, 0, QTableWidgetItem(name))
-            self.table.setItem(i, 1, QTableWidgetItem(rank))
-            self.table.setItem(i, 2, QTableWidgetItem(typ_name))
-            self.table.setItem(i, 3, QTableWidgetItem(desc))
 
-    def use_from_table(self):
-        row = self.table.currentRow()
-        if row >= 0:
-            mod = self.table.item(row, 0).text()
-            self.input_queue.put(f"use modules/{mod}")
+        for module_path, meta in sorted(modules.items()):
+            if not meta.get("options"):
+                continue
+
+            display_name = module_path.replace("modules/", "")
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.ItemDataRole.UserRole, module_path)
+            font = QFont("Hack", 10)
+            item.setFont(font)
+            # Color code by type
+            if "/recon/" in module_path:
+                item.setForeground(QColor("#ffffff"))  # Cyan
+            elif "/strike/" in module_path:
+                item.setForeground(QColor("#ffffff"))  # Red
+            elif "/hold/" in module_path:
+                item.setForeground(QColor("#ffffff"))  # Yellow
+            elif "/ops/" in module_path:
+                item.setForeground(QColor("#ffffff"))  # Green
+            elif "/payload" in module_path:
+                item.setForeground(QColor("#ffffff"))  # Pink
+
+            self.module_list.addItem(item)
+
+        self.update_session_info()
+
+    def on_category_click(self):
+        """Handle category button click"""
+        button = self.sender()
+        category = button.property('category')
+        self.filter_modules_by_category(category)
+
+    def filter_modules_by_category(self, category):
+        """Filter modules by category"""
+        for i in range(self.module_list.count()):
+            item = self.module_list.item(i)
+            module_path = item.data(Qt.ItemDataRole.UserRole)
+
+            if category == "all":
+                item.setHidden(False)
+            elif category == "payloads":
+                item.setHidden("payload" not in module_path.lower())
+            else:
+                item.setHidden(f"/{category}/" not in module_path)
+
+    def search_modules(self):
+        """Search modules as user types"""
+        search_text = self.search_input.text().lower()
+
+        for i in range(self.module_list.count()):
+            item = self.module_list.item(i)
+            module_path = item.data(Qt.ItemDataRole.UserRole)
+            meta = self.framework.metadata.get(module_path, {})
+            description = meta.get("description", "").lower()
+
+            matches = (search_text in module_path.lower() or
+                       search_text in description)
+            item.setHidden(not matches)
+
+    def perform_search(self):
+        """Perform search command"""
+        search_text = self.search_input.text()
+        if search_text:
+            self.execute_command("search", [search_text])
+
+    def load_selected_module(self, item):
+        """Load selected module TANPA OUTPUT COMMAND KE CONSOLE"""
+        module_path = item.data(Qt.ItemDataRole.UserRole)
+        
+        try:
+            # Pause global capture sementara
+            self.capture.stop_capture()
+            
+            # Execute use command tanpa output ke console
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer), redirect_stderr(output_buffer):
+                self.framework.cmd_use([module_path])
+            
+            # Resume capture
+            self.capture.start_capture()
+            
+            # Update UI state tanpa output ke console
+            if self.framework.loaded_module:
+                self.current_module = self.framework.loaded_module.name
+                self.current_module_label.setText(f"Loaded: {self.current_module}")
+                self.current_module_label.setStyleSheet("color: #50fa7b; font-weight: bold;")
+                self.run_btn.setEnabled(True)
+                self.back_btn.setEnabled(True)
+                
+                # Load module options
+                self.load_module_options()
+                
+                # Show module info di tab Module Info (bukan console)
+                self.show_module_info_in_tab()
+                
+        except Exception as e:
+            self.append_output(f"[red]Error loading module: {e}[/red]")
+
+    def show_module_info_in_tab(self):
+        """Show module info di tab Module Info saja"""
+        try:
+            # Pause global capture
+            self.capture.stop_capture()
+            
+            # Capture info output
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer), redirect_stderr(output_buffer):
+                self.framework.cmd_info([])
+            
+            # Get the output
+            info_output = output_buffer.getvalue()
+            
+            # Resume capture
+            self.capture.start_capture()
+            
+            # Tampilkan di Module Info tab saja
+            if info_output.strip():
+                clean_info = re.sub(r'\x1b\[[0-9;]*[mG]', '', info_output)
+                self.module_detail_info.setPlainText(clean_info)
+                
+            # Switch ke Module Info tab
+            self.tabs.setCurrentIndex(2)
+            
+        except Exception as e:
+            self.module_detail_info.setPlainText(f"Error loading module info: {e}")
+
+    def execute_command(self, command=None, args=None):
+        """Execute framework command"""
+        if command is None:
+            # Get command from input
+            full_command = self.command_input.text().strip()
+            if not full_command:
+                return
+
+            # Add to history
+            self.command_history.append(full_command)
+            self.history_index = len(self.command_history)
+
+            # Parse command
+            parts = full_command.split()
+            command = parts[0]
+            args = parts[1:] if len(parts) > 1 else []
+
+            # Clear input
+            self.command_input.clear()
+
+        # Tampilkan command yang di-execute (kecuali untuk klik module)
+        if command != "use" or not args or "modules/" not in args[0]:
+            self.append_output(f"[yellow]> {command} {' '.join(args)}[/yellow]")
+
+        try:
+            if hasattr(self.framework, f"cmd_{command}"):
+                # Pause global capture selama command execution
+                self.capture.stop_capture()
+
+                # Redirect output sementara
+                output_buffer = io.StringIO()
+                with redirect_stdout(output_buffer), redirect_stderr(output_buffer):
+                    getattr(self.framework, f"cmd_{command}")(args)
+
+                # Capture output dari command
+                output = output_buffer.getvalue()
+                if output.strip():
+                    # Untuk command 'info', tampilkan di tab Module Info saja
+                    if command == "info":
+                        clean_info = re.sub(r'\x1b\[[0-9;]*[mG]', '', output)
+                        self.module_detail_info.setPlainText(clean_info)
+                        self.tabs.setCurrentIndex(2)  # Switch ke Module Info tab
+                    else:
+                        self.append_output(output)
+
+                # Resume global capture
+                self.capture.start_capture()
+
+                # Update UI berdasarkan command
+                if command == "use":
+                    self.on_module_loaded()
+                elif command == "back":
+                    self.on_module_unloaded()
+
+            else:
+                self.append_output(f"[red]Unknown command: {command}[/red]")
+
+        except Exception as e:
+            self.append_output(f"[red]Error executing command: {e}[/red]")
+
+        self.update_session_info()
+
+    def on_module_loaded(self):
+        """Handle when module is loaded"""
+        if self.framework.loaded_module:
+            self.current_module = self.framework.loaded_module.name
+            self.current_module_label.setText(f"Loaded: {self.current_module}")
+            self.current_module_label.setStyleSheet(
+                "color: #50fa7b; font-weight: bold;")
+
+            self.run_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
+
+            # Load module options
+            self.load_module_options()
+
+            # Show module info di tab Module Info
+            self.show_module_info_in_tab()
+
+    def on_module_unloaded(self):
+        """Handle when module is unloaded"""
+        self.current_module = None
+        self.current_module_label.setText("No module loaded")
+        self.current_module_label.setStyleSheet(
+            "color: #ff5555; font-weight: bold;")
+
+        self.run_btn.setEnabled(False)
+        self.back_btn.setEnabled(False)
+
+        # Clear options tab
+        self.clear_options_tab()
+        
+        # Clear module info tab
+        self.module_detail_info.clear()
+
+    def load_module_options(self):
+        """Load module options into options tab"""
+        self.clear_options_tab()
+
+        if not self.framework.loaded_module:
+            return
+
+        opts = self.framework.loaded_module.get_options()
+        self.option_widgets = {}
+
+        for name, info in opts.items():
+            label = QLabel(name)
+            value = str(info.get('value') or info.get('default') or "")
+            required = info.get('required', False)
+            description = info.get('description', 'No description available')
+
+            if required:
+                label.setStyleSheet("color: #ff5555; font-weight: bold;")
+                label.setText(f"{name} *")
+            else:
+                label.setStyleSheet("color: #d4d4d4;")
+
+            # Create input widget
+            line_edit = QLineEdit(value)
+            line_edit.setPlaceholderText(description)
+
+            # Tooltip with full description
+            line_edit.setToolTip(description)
+            label.setToolTip(description)
+
+            self.options_layout.addRow(label, line_edit)
+            self.option_widgets[name] = line_edit
+
+        # Switch to options tab
+        self.tabs.setCurrentIndex(1)
+
+    def clear_options_tab(self):
+        """Clear options tab"""
+        for i in reversed(range(self.options_layout.count())):
+            item = self.options_layout.itemAt(i)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def run_module(self):
+        """Run the current module dengan FIXED OUTPUT CAPTURE"""
+        if not self.framework.loaded_module:
+            self.append_output("[red]No module loaded[/red]")
+            return
+
+        # Update options from GUI
+        for name, widget in self.option_widgets.items():
+            value = widget.text().strip()
+            if value:
+                try:
+                    self.framework.loaded_module.set_option(name, value)
+                    self.append_output(f"[cyan]Set {name} => {value}[/cyan]")
+                except Exception as e:
+                    self.append_output(f"[red]Error setting {name}: {e}[/red]")
+
+        # Disable run button during execution
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("RUNNING...")
+
+        # Gunakan ModuleRunner dengan subprocess patching
+        self.module_runner = ModuleRunner(
+            self.framework, self.framework.loaded_module)
+        self.module_runner.output.connect(self.append_output)
+        self.module_runner.finished.connect(self.on_module_finished)
+        self.module_runner.start()
+
+    def on_module_finished(self):
+        """Handle module completion"""
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("🚀 RUN MODULE")
+        self.append_output("[green]Module execution completed[/green]")
+
+    def unload_module(self):
+        """Unload current module"""
+        self.execute_command("back", [])
+
+    def quick_command(self, command):
+        """Execute quick command from buttons"""
+        self.execute_command(command, [])
+
+    def refresh_modules(self):
+        """Refresh modules list"""
+        self.framework.scan_modules()
+        self.load_all_modules()
+        self.append_output("[green]Modules refreshed[/green]")
+
+    def clear_console(self):
+        """Clear console output"""
+        self.console_output.clear()
+
+    def update_session_info(self):
+        """Update session information"""
+        info_text = f"""
+User: {self.framework.session.get('user', 'unknown')}
+Modules: {len(self.framework.modules)}
+Loaded: {self.current_module or 'None'}
+Framework: LazyFramework GUI
+        """.strip()
+
+        self.session_info.setPlainText(info_text)
+
+    def keyPressEvent(self, event):
+        """Handle key press events"""
+        if event.key() == Qt.Key.Key_Up:
+            # Command history up
+            if self.command_history and self.history_index > 0:
+                self.history_index -= 1
+                self.command_input.setText(
+                    self.command_history[self.history_index])
+        elif event.key() == Qt.Key.Key_Down:
+            # Command history down
+            if self.command_history and self.history_index < len(self.command_history) - 1:
+                self.history_index += 1
+                self.command_input.setText(
+                    self.command_history[self.history_index])
+            elif self.history_index == len(self.command_history) - 1:
+                self.history_index = len(self.command_history)
+                self.command_input.clear()
+        else:
+            super().keyPressEvent(event)
+
 
 def run_gui():
+    """Run the GUI application"""
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = GUIFramework()
+    app.setApplicationName("LazyFramework GUI")
+    app.setApplicationVersion("2.0")
+
+    # Set dark palette
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+    palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(30, 30, 30))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Button, QColor(45, 45, 45))
+    palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+    app.setPalette(palette)
+
+    win = LazyFrameworkGUI()
     win.show()
+
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     run_gui()
