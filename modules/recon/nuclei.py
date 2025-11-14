@@ -18,7 +18,7 @@ MODULE_INFO = {
 
 # === KATEGORI TEMPLATES RESMI ===
 NUCLEI_CATEGORIES = [
-    "cves", "vulnerabilities", "misconfiguration", "exposures",
+    "exposures",
     "fuzzing", "takeovers", "dns", "file", "network", "ssl",
     "technologies", "default-logins", "iot", "panels",
     "token-spray", "workflow"
@@ -33,7 +33,7 @@ OPTIONS = {
         "description": "Target: URL, IP, atau file list[](http://site.com)",
     },
     "TEMPLATE": {
-        "default": "cves,vulnerabilities,misconfiguration",
+        "default": "",
         "required": False,
         "description": "Pilih kategori template (multi-select)",
         "choices": NUCLEI_CATEGORIES,
