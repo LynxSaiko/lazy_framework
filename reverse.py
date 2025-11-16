@@ -87,7 +87,7 @@ def send_session_command(session_id, command):
     sock = session['socket']
     
     try:
-        # Send command dengan newline
+        # Kirim perintah dengan newline
         sock.send((command + "\n").encode())
         console.print(f"[green]Perintah berhasil dikirim: {command}[/]")
         return True
@@ -128,7 +128,7 @@ def handler(client_sock, addr, framework_session):
 
     try:
         # Set socket timeout untuk non-blocking
-        client_sock.settimeout(1)  # Increased timeout to allow for data to be received
+        client_sock.settimeout(0.5)  # Timeout lebih rendah
         buffer = ""
         
         while True:
@@ -163,7 +163,8 @@ def handler(client_sock, addr, framework_session):
                                 QTimer.singleShot(0, lambda sid=sess_id, l=line: gui_instance.append_output(f"[session:{sid}] {l}"))
 
             except socket.timeout:
-                continue  # Timeout normal untuk non-blocking
+                # Timeout normal untuk non-blocking
+                continue
             except Exception as e:
                 console.print(f"[red]Receive error: {e}[/]")
                 break
