@@ -1,44 +1,33 @@
     def add_session(self, session_id: str, ip: str, port: int, type: str, payload: str):
-        """Tambah session baru ke Session tab"""
-        if not hasattr(self, 'sessions'):
-            return
         self.sessions[session_id] = {
-            'ip': ip,
-            'port': port,
-            'type': type,
-            'payload': payload,
-            'status': 'waiting',
-            'output': '',
-            'handler': None
+            "ip": ip, "port": port, "type": type,
+            "payload": payload, "status": "waiting",
+            "remote_ip": "", "output": ""
         }
-        self.update_sessions_tab()
+        self.update_sessions_display()
 
     def append_session_output(self, session_id: str, text: str):
-        """Output ke Session tab (khusus session)"""
-        if session_id not in self.sessions:
-            return
-        self.sessions[session_id]['output'] += text + '\n'
-        self.update_sessions_tab()
+        if session_id in self.sessions:
+            self.sessions[session_id]["output"] += text + "\n"
+            self.update_sessions_display()
 
     def update_session_status(self, session_id: str, status: str, remote_ip: str = None):
-        """Update status session"""
-        if session_id not in self.sessions:
-            return
-        self.sessions[session_id]['status'] = status
-        if remote_ip:
-            self.sessions[session_id]['remote_ip'] = remote_ip
-        self.update_sessions_tab()
+        if session_id in self.sessions:
+            self.sessions[session_id]["status"] = status
+            if remote_ip:
+                self.sessions[session_id]["remote_ip"] = remote_ip
+            self.update_sessions_display()
 
-
-    def update_sessions_tab(self):
-        """Refresh Session tab"""
-        if not hasattr(self, 'session_output'):
+    def update_sessions_display(self):
+        if not hasattr(self, "session_output"):
             return
         self.session_output.clear()
-        for sid, data in self.sessions.items():
-            status_color = "green" if data['status'] == 'active' else "yellow" if data['status'] == 'waiting' else "red"
-            header = f"[bold]Session {sid}[/] | {data['ip']}:{data['port']} | {data['type']} | Status: [{status_color}]{data['status']}[/]\n"
-            self.session_output.append(header)
-            if data['output']:
-                self.session_output.append(data['output'])
-            self.session_output.append("\n" + "-"*80 + "\ output\n")
+        for sid, s in self.sessions.items():
+            color = {"active": "green", "waiting": "yellow", "closed": "red"}.get(s["status"], "white")
+            header = f"[bold]Session {sid}[/] | {s['ip']}:{s['port']} | {s['type']} | [{color}]{s['status']}[/]"
+            if s.get("remote_ip"):
+                header += f" | From: {s['remote_ip']}"
+            self.session_output.append(header + "\n")
+            if s["output"]:
+                self.session_output.append(s["output"])
+            self.session_output.append("\n" + "─" * 80 + "\n")
